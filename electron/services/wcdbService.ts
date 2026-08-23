@@ -26,6 +26,7 @@ export class WcdbService {
   private hostGeneration = 0
   private lastSpawnAt = 0
   private consecutiveFastFailures = 0
+  private lastHostError: string | null = null
 
   constructor() {}
 
@@ -53,6 +54,7 @@ export class WcdbService {
 
       const child = this.worker
       child.on('message', (msg: any) => {
+        this.lastHostError = null
         const { id, result, error, type, payload } = msg
 
         if (type === 'monitor') {
@@ -77,6 +79,7 @@ export class WcdbService {
         // 置 null 允许下次调用重建（否则永久“不可用”）。
         console.error('WCDB 宿主进程错误:', err)
         const errorMsg = err instanceof Error ? err.message : String(err)
+        this.lastHostError = errorMsg
         for (const [id, p] of this.pending) {
           if (p.timer) clearTimeout(p.timer)
           p.reject(new Error(`WCDB 宿主进程错误: ${errorMsg}`))
@@ -85,7 +88,7 @@ export class WcdbService {
         if (this.worker === child) this.worker = null
       })
 
-      child.on('exit', (code) => {
+      child.on('exit', (code, signal) => {
         // 宿主进程退出，无论退出码都 reject 在途请求：
         // 退出码 0 也可能在请求尚未完成时发生（如被外部杀进程），
         // 挂着的请求若只靠 180s 超时兜底会长时间假死。
@@ -97,9 +100,12 @@ export class WcdbService {
         } else if (this.pending.size > 0) {
           this.consecutiveFastFailures = 0
         }
+        const stderr = child.getRecentStderr()
+        const exitDetail = code !== null ? `退出码: ${code}` : `信号: ${signal || '未知'}`
         const errorMsg = code !== 0
-          ? `WCDB 宿主进程异常退出 (退出码: ${code})。可能是数据服务加载失败，请检查是否安装了 Visual C++ Redistributable。`
+          ? `WCDB 宿主进程异常退出 (${exitDetail})${stderr ? `：${stderr}` : '。可能是数据服务加载失败或进程被安全软件终止。'}`
           : 'WCDB 宿主进程已退出'
+        this.lastHostError = errorMsg
         for (const [id, p] of this.pending) {
           if (p.timer) clearTimeout(p.timer)
           p.reject(new Error(errorMsg))
@@ -119,7 +125,8 @@ export class WcdbService {
       }
 
     } catch (e) {
-      // Failed to create worker
+      this.lastHostError = e instanceof Error ? e.message : String(e)
+      console.error('WCDB 宿主进程初始化失败:', e)
     }
   }
 
@@ -128,7 +135,10 @@ export class WcdbService {
    */
   private callWorker<T>(type: string, payload: any = {}, opts?: { timeoutMs?: number }): Promise<T> {
     if (!this.worker) this.initWorker()
-    if (!this.worker) return Promise.reject(new Error('WCDB 宿主进程不可用'))
+    if (!this.worker) {
+      const detail = this.lastHostError ? `：${this.lastHostError}` : ''
+      return Promise.reject(new Error(`WCDB 宿主进程不可用${detail}`))
+    }
 
     return new Promise((resolve, reject) => {
       const id = ++this.messageId
