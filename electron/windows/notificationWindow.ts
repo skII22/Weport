@@ -134,14 +134,7 @@ function ensureGlassPanel(
 let cachedSnapshot: string | null = null;
 
 async function captureDesktopSnapshot(): Promise<string | null> {
-  // 弹窗自身此时已在屏幕上（本函数用于生成玻璃回退背景）。若不临时启用
-  // 内容保护，截图会把弹窗自己也拍进去，玻璃背景里出现"弹窗套弹窗"。
-  // 拍摄期间临时排除自身，拍完立即恢复（用户要求弹窗可被系统截图/录屏）。
-  let wasProtection = false;
   try {
-    if (notificationWindow && !notificationWindow.isDestroyed()) {
-      try { wasProtection = true; notificationWindow.setContentProtection(true); } catch { /* noop */ }
-    }
     const display = screen.getPrimaryDisplay();
     const scale = 0.5; // 半分辨率：玻璃模糊会抹平降采样，肉眼不可辨
     const sources = await desktopCapturer.getSources({
@@ -160,12 +153,6 @@ async function captureDesktopSnapshot(): Promise<string | null> {
   } catch (error) {
     console.warn("[NotificationWindow] Failed to capture desktop snapshot:", error);
     return null;
-  } finally {
-    try {
-      if (wasProtection && notificationWindow && !notificationWindow.isDestroyed()) {
-        notificationWindow.setContentProtection(false);
-      }
-    } catch { /* noop */ }
   }
 }
 
@@ -243,11 +230,9 @@ export function createNotificationWindow() {
     },
   });
 
-  // 用户要求通知窗口可被系统截图（与微信弹窗行为一致）。
-  // 注意：setContentProtection(true) 会把窗口从屏幕采集排除（WDA_EXCLUDEFROMCAPTURE），
-  // 导致系统截图/录屏中看不到弹窗——因此不再启用内容保护。
-  // 玻璃回环风险由窗口尺寸小 + 渲染层重绘控制；如需恢复保护，直接启用下一行即可。
-  // notificationWindow.setContentProtection(true);
+  // 必须从桌面采集中排除通知窗口，否则回退玻璃会把自身再次拍入，
+  // 形成通知套通知的反馈回环。QA 截图路径会在 capturePage 前临时关闭。
+  notificationWindow.setContentProtection(true);
 
   applyWindowSize(notificationWindow, width, height);
 
