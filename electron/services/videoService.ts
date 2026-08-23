@@ -20,6 +20,7 @@ interface TimedCacheEntry<T> {
 
 interface VideoIndexEntry {
   videoPath?: string
+  rawVideoPath?: string
   coverPath?: string
   thumbPath?: string
 }
@@ -376,7 +377,7 @@ class VideoService {
             if (md5.endsWith('_raw')) {
               const baseMd5 = md5.replace(/_raw$/, '')
               const baseEntry = ensureEntry(baseMd5)
-              if (!baseEntry.videoPath) baseEntry.videoPath = fullPath
+              if (!baseEntry.rawVideoPath) baseEntry.rawVideoPath = fullPath
             }
             continue
           }
@@ -425,26 +426,22 @@ class VideoService {
     const normalizedMd5 = String(md5 || '').trim().toLowerCase()
     if (!normalizedMd5) return null
 
-    const candidates = [normalizedMd5]
     const baseMd5 = normalizedMd5.replace(/_raw$/, '')
-    if (baseMd5 !== normalizedMd5) {
-      candidates.push(baseMd5)
-    } else {
-      candidates.push(`${normalizedMd5}_raw`)
-    }
+    const candidates = Array.from(new Set([baseMd5, `${baseMd5}_raw`, normalizedMd5]))
 
     for (const key of candidates) {
       const entry = index.get(key)
-      if (!entry?.videoPath) continue
-      if (!(await pathExists(entry.videoPath))) continue
+      const videoPath = entry?.rawVideoPath || entry?.videoPath
+      if (!videoPath) continue
+      if (!(await pathExists(videoPath))) continue
       if (!includePoster) {
         return {
-          videoUrl: entry.videoPath,
+          videoUrl: videoPath,
           exists: true
         }
       }
       return {
-        videoUrl: entry.videoPath,
+        videoUrl: videoPath,
         coverUrl: await this.fileToPosterUrl(entry.coverPath, 'image/jpeg', posterFormat),
         thumbUrl: await this.fileToPosterUrl(entry.thumbPath, 'image/jpeg', posterFormat),
         exists: true

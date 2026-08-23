@@ -2468,7 +2468,33 @@ class WeportAiService {
         onReasoning: (delta) => this.emit({ type: 'reasoning_delta', chatId, delta }),
         onText: (delta) => this.emit({ type: 'text_delta', chatId, delta }),
       })
-      this.appendDebugLog({ kind: 'request', chatId, model: profile.model, provider: profile.providerId, protocol: profile.protocol, messages: history.length, tools: requestShape.tools.length, durationMs: Date.now() - startedAt })
+      this.appendDebugLog({
+        kind: 'request',
+        chatId,
+        model: profile.model,
+        provider: profile.providerId,
+        protocol: profile.protocol,
+        messages: history.length,
+        tools: requestShape.tools.length,
+        httpStatus: result.responseMeta?.status,
+        contentType: result.responseMeta?.contentType,
+        responseBytes: result.responseMeta?.bytes,
+        responseEvents: result.responseMeta?.events,
+        parseMode: result.responseMeta?.parseMode,
+        contentChars: result.content.length,
+        reasoningChars: result.reasoning.length,
+        toolCalls: result.toolCalls.length,
+        finishReason: result.finishReason,
+        durationMs: Date.now() - startedAt,
+      })
+      if (!result.content.trim() && !result.reasoning.trim() && result.toolCalls.length === 0) {
+        const error = new Error(
+          `AI 服务返回了空响应（解析方式：${result.responseMeta?.parseMode || 'unknown'}）。请确认所选协议与服务端接口一致。`
+        ) as Error & { status?: number; responseMeta?: ProviderStreamResult['responseMeta'] }
+        error.status = result.responseMeta?.status
+        error.responseMeta = result.responseMeta
+        throw error
+      }
       return {
         ok: true,
         content: result.content,
@@ -2478,9 +2504,23 @@ class WeportAiService {
       }
     } catch (error) {
       if (signal.aborted) return { ok: false, error: '已中止' }
-      const status = Number((error as { status?: number })?.status)
+      const typedError = error as { status?: number; responseMeta?: ProviderStreamResult['responseMeta'] }
+      const status = Number(typedError?.status)
+      const responseMeta = typedError?.responseMeta
       const detail = String((error as Error)?.message || error).trim()
-      this.appendDebugLog({ kind: 'error', chatId, provider: profile.providerId, protocol: profile.protocol, httpStatus: status || undefined, error: detail, durationMs: Date.now() - startedAt })
+      this.appendDebugLog({
+        kind: 'error',
+        chatId,
+        provider: profile.providerId,
+        protocol: profile.protocol,
+        httpStatus: status || responseMeta?.status || undefined,
+        contentType: responseMeta?.contentType,
+        responseBytes: responseMeta?.bytes,
+        responseEvents: responseMeta?.events,
+        parseMode: responseMeta?.parseMode,
+        error: detail,
+        durationMs: Date.now() - startedAt,
+      })
       return { ok: false, error: detail || '模型调用失败', httpStatus: status || undefined }
     }
   }

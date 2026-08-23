@@ -123,6 +123,13 @@ export class ExportOrchestrator {
         failedSessionIds?: string[]
         failedSessionErrors?: Record<string, string>
         sessionOutputPaths?: Record<string, string>
+        imageBestSourceFiles?: number
+        imageOriginalFiles?: number
+        imageHdFiles?: number
+        imageMiddleFiles?: number
+        imageUnknownBestFiles?: number
+        imageThumbnailFiles?: number
+        imageUpgradedFiles?: number
         error?: string
         }> {
         let successCount = 0;
@@ -578,6 +585,14 @@ export class ExportOrchestrator {
           }, { force: true })
           progressEmitter.flush()
           console.info(`[Export] session concurrency requested=${rawConcurrency} effective=${sessionConcurrency} peak=${peakSessionWorkers} sessions=${sessionIds.length}`)
+          const media = exportMediaEnabled
+            ? this.context.getMediaTelemetrySnapshot()
+            : {}
+          if (exportMediaEnabled) {
+            console.info(
+              `[Export][ImageQuality] original=${media.imageOriginalFiles || 0} hd=${media.imageHdFiles || 0} middle=${media.imageMiddleFiles || 0} otherLocalBest=${media.imageUnknownBestFiles || 0} thumbnailOnly=${media.imageThumbnailFiles || 0} upgraded=${media.imageUpgradedFiles || 0}`
+            )
+          }
 
           const allFailed = successCount === 0 && failCount > 0
           const failureSummary = allFailed
@@ -591,6 +606,13 @@ export class ExportOrchestrator {
             failedSessionIds,
             failedSessionErrors,
             sessionOutputPaths,
+            imageBestSourceFiles: media.imageBestSourceFiles || 0,
+            imageOriginalFiles: media.imageOriginalFiles || 0,
+            imageHdFiles: media.imageHdFiles || 0,
+            imageMiddleFiles: media.imageMiddleFiles || 0,
+            imageUnknownBestFiles: media.imageUnknownBestFiles || 0,
+            imageThumbnailFiles: media.imageThumbnailFiles || 0,
+            imageUpgradedFiles: media.imageUpgradedFiles || 0,
             error: failureSummary
           }
         } catch (e) {

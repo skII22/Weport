@@ -150,6 +150,13 @@ export interface ExportProgress {
   mediaCacheFillFiles?: number
   mediaDedupReuseFiles?: number
   mediaBytesWritten?: number
+  imageBestSourceFiles?: number
+  imageOriginalFiles?: number
+  imageHdFiles?: number
+  imageMiddleFiles?: number
+  imageUnknownBestFiles?: number
+  imageThumbnailFiles?: number
+  imageUpgradedFiles?: number
 }
 
 export interface MediaExportTelemetry {
@@ -159,6 +166,13 @@ export interface MediaExportTelemetry {
   cacheFillFiles: number
   dedupReuseFiles: number
   bytesWritten: number
+  imageBestSourceFiles: number
+  imageOriginalFiles: number
+  imageHdFiles: number
+  imageMiddleFiles: number
+  imageUnknownBestFiles: number
+  imageThumbnailFiles: number
+  imageUpgradedFiles: number
 }
 
 export interface MediaSourceResolution {

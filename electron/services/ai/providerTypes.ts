@@ -105,6 +105,13 @@ export interface ProviderStreamResult {
     promptCacheHitTokens: number
   }
   finishReason?: string
+  responseMeta?: {
+    status: number
+    contentType: string
+    bytes: number
+    events: number
+    parseMode: 'sse' | 'json' | 'ndjson' | 'empty' | 'unknown'
+  }
 }
 
 export interface ProviderAdapter {

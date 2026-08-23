@@ -41,6 +41,7 @@ import { exportTaskControlService } from './services/exportTaskControlService'
 import { backupService } from './services/backupService'
 import { httpService } from './services/httpService'
 import { mcpService } from './services/mcpService'
+import { installRuntimeFileLogging } from './services/runtimeLogService'
 import { windowsHelloService } from './services/windowsHelloService'
 import { dbPathService } from './services/dbPathService'
 import { KeyService } from './services/keyService'
@@ -1953,6 +1954,8 @@ function registerIpcHandlers() {
   ipcMain.handle('http:stop', () => httpService.stop())
   ipcMain.handle('http:getStatus', () => httpService.getStatus())
   ipcMain.handle('mcp:getStatus', () => mcpService.getStatus())
+  ipcMain.handle('mcp:getToken', () => mcpService.getToken())
+  ipcMain.handle('mcp:regenerateToken', () => mcpService.regenerateToken())
   ipcMain.handle('auth:verifyHello', (_e, message: string) => windowsHelloService.verify(String(message || '请验证您的身份')))
 
   // 数据库路径
@@ -5347,6 +5350,7 @@ function installMainProcessErrorHandlers() {
 }
 
 function startApp() {
+  installRuntimeFileLogging()
   installMainProcessErrorHandlers()
   const aiSelfTest = process.env.WEPORT_AI_SELFTEST === '1'
   if (process.platform !== 'win32' && process.platform !== 'darwin') {

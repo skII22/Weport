@@ -96,6 +96,11 @@ interface ElectronApi {
     stop: () => Promise<void>
     getStatus: () => Promise<{ running: boolean; port: number; host: string }>
   }
+  mcp: {
+    getStatus: () => Promise<{ running: boolean; port: number; host: string; tokenConfigured: boolean }>
+    getToken: () => Promise<{ success: true; token: string }>
+    regenerateToken: () => Promise<{ success: boolean; token?: string; error?: string }>
+  }
   auth: {
     verifyHello: (message?: string) => Promise<{ success: boolean; error?: string }>
   }
