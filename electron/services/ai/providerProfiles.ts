@@ -165,9 +165,7 @@ export class ProviderProfileService {
     if (!profile.apiKey && !catalog?.apiKeyOptional) throw new Error('请先填写 API key')
     let parsed: URL
     try { parsed = new URL(profile.baseUrl) } catch { throw new Error('服务地址必须以 http:// 或 https:// 开头') }
-    const host = parsed.hostname.toLowerCase()
-    const local = host === 'localhost' || host === '127.0.0.1' || host === '::1' || host.endsWith('.localhost')
-    if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && local)) throw new Error('服务地址必须使用 HTTPS（仅 localhost 可使用 HTTP）')
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('服务地址必须以 http:// 或 https:// 开头')
     if (existing) store.profiles = store.profiles.map((item) => item.id === existing.id ? profile : item)
     else store.profiles.push(profile)
     if (!store.activeProfileId) store.activeProfileId = profile.id
