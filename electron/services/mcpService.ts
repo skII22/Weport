@@ -404,6 +404,34 @@ class McpService {
   getStatus(): { running: boolean; port: number; host: string; tokenConfigured: boolean } {
     return { running: this.running, port: this.port, host: this.host, tokenConfigured: !!this.token }
   }
+
+  getToken(): { success: true; token: string } {
+    const token = this.token || this.resolveToken()
+    this.token = token
+    return { success: true, token }
+  }
+
+  async regenerateToken(): Promise<{ success: boolean; token?: string; error?: string }> {
+    const token = randomBytes(16).toString('hex')
+    const wasRunning = this.running
+    const port = this.port
+    const host = this.host
+
+    try {
+      this.configService.set('mcpToken', token)
+      this.token = token
+      if (wasRunning) {
+        await this.stop()
+        const restarted = await this.start(port, host)
+        if (!restarted.success) {
+          return { success: false, error: restarted.error || 'MCP 服务重启失败' }
+        }
+      }
+      return { success: true, token }
+    } catch (e) {
+      return { success: false, error: String((e as Error)?.message || e) }
+    }
+  }
 }
 
 function readBody(req: http.IncomingMessage): Promise<string | undefined> {

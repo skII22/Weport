@@ -43,6 +43,8 @@ import {
   LineChart,
   Palette,
   Contrast,
+  Copy,
+  Server,
   Settings2 as SettingsIcon,
 } from 'lucide-react'
 
@@ -224,6 +226,10 @@ export default function App() {
   const [httpApiEnabled, setHttpApiEnabled] = useState(false)
   const [httpApiRunning, setHttpApiRunning] = useState(false)
   const [httpApiPort, setHttpApiPort] = useState(5031)
+  const [mcpStatus, setMcpStatus] = useState<{ running: boolean; port: number; host: string; tokenConfigured: boolean } | null>(null)
+  const [mcpToken, setMcpToken] = useState('')
+  const [showMcpToken, setShowMcpToken] = useState(false)
+  const [mcpBusy, setMcpBusy] = useState(false)
   const [clearOpen, setClearOpen] = useState(false)
   const [toasts, setToasts] = useState<Toast[]>([])
   const toastTimers = useRef<Map<number, number>>(new Map())
@@ -590,6 +596,9 @@ export default function App() {
             if (status?.running) setHttpApiPort(status.port)
           }
         } catch { /* noop */ }
+        try {
+          setMcpStatus(await api.mcp.getStatus())
+        } catch { /* noop */ }
         const silent = await api.config.get('silentStartup')
         setSilentStartup(silent === true)
         const close = await api.config.get('windowCloseBehavior')
@@ -890,7 +899,24 @@ export default function App() {
       const result = await api.export.exportSessions(exportPath.trim(), options)
       await refreshExportLog(exportPath.trim())
       if (result.success) {
-        pushToast('ok', '导出完成', `成功 ${result.successCount ?? 0} 个会话 → ${result.formatFolder}/（已覆盖同名文件）`, 7000)
+        const bestLocalImages = Math.max(0, Number(result.imageBestSourceFiles || 0))
+        const originalImages = Math.max(0, Number(result.imageOriginalFiles || 0))
+        const middleImages = Math.max(0, Number(result.imageMiddleFiles || 0))
+        const thumbnailImages = Math.max(0, Number(result.imageThumbnailFiles || 0))
+        const upgradedImages = Math.max(0, Number(result.imageUpgradedFiles || 0))
+        if (thumbnailImages > 0) {
+          pushToast(
+            'info',
+            '导出完成，但部分图片仅有缩略图',
+            `非缩略图 ${bestLocalImages} 张（原文件 ${originalImages} · 中质量 ${middleImages}）· 仅缩略图 ${thumbnailImages} 张 · 覆盖升级 ${upgradedImages} 张`,
+            12000
+          )
+        } else {
+          const imageSummary = exportMedia.images
+            ? ` · 非缩略图 ${bestLocalImages} 张（原文件 ${originalImages} · 中质量 ${middleImages}）· 覆盖升级 ${upgradedImages} 张`
+            : ''
+          pushToast('ok', '导出完成', `成功 ${result.successCount ?? 0} 个会话${imageSummary} → ${result.formatFolder}/`, 8000)
+        }
         setProgress((p: any) => (p ? { ...p, current: p.total || p.current, phaseLabel: '完成', phase: 'complete' } : { current: 1, total: 1, phaseLabel: '完成', phase: 'complete' }))
       } else {
         pushToast('err', '导出未完全成功', result.error || `成功 ${result.successCount ?? 0} / 失败 ${result.failCount ?? 0}`, 12000)
@@ -1037,6 +1063,70 @@ export default function App() {
       }
     } catch {
       setHttpApiRunning(false)
+    }
+  }
+
+  async function loadMcpToken(): Promise<string> {
+    if (mcpToken) return mcpToken
+    const result = await api.mcp.getToken()
+    const token = String(result?.token || '')
+    setMcpToken(token)
+    return token
+  }
+
+  async function copyText(value: string, label: string) {
+    try {
+      await navigator.clipboard.writeText(value)
+      pushToast('ok', `${label}已复制`)
+    } catch (e) {
+      pushToast('err', `${label}复制失败`, String(e))
+    }
+  }
+
+  async function revealMcpToken() {
+    if (showMcpToken) {
+      setShowMcpToken(false)
+      return
+    }
+    setMcpBusy(true)
+    try {
+      const token = await loadMcpToken()
+      if (!token) throw new Error('MCP token 为空')
+      setShowMcpToken(true)
+    } catch (e) {
+      pushToast('err', '读取 MCP token 失败', String(e))
+    } finally {
+      setMcpBusy(false)
+    }
+  }
+
+  async function copyMcpToken() {
+    setMcpBusy(true)
+    try {
+      const token = await loadMcpToken()
+      if (!token) throw new Error('MCP token 为空')
+      await copyText(token, 'MCP token')
+    } catch (e) {
+      pushToast('err', '读取 MCP token 失败', String(e))
+    } finally {
+      setMcpBusy(false)
+    }
+  }
+
+  async function regenerateMcpToken() {
+    if (!window.confirm('重新生成后，现有 MCP 客户端配置会立即失效。确定继续吗？')) return
+    setMcpBusy(true)
+    try {
+      const result = await api.mcp.regenerateToken()
+      if (!result.success || !result.token) throw new Error(result.error || '重新生成失败')
+      setMcpToken(result.token)
+      setShowMcpToken(true)
+      setMcpStatus(await api.mcp.getStatus())
+      pushToast('ok', 'MCP token 已重新生成', '请更新已连接客户端的认证配置')
+    } catch (e) {
+      pushToast('err', '重新生成 MCP token 失败', String(e), 8000)
+    } finally {
+      setMcpBusy(false)
     }
   }
 
@@ -2163,6 +2253,91 @@ export default function App() {
                   <input type="checkbox" checked={closeToTray} onChange={(e) => void toggleCloseToTray(e.target.checked)} />
                   <span className="track" />
                 </label>
+              </div>
+            </section>
+
+            <section className="panel">
+              <div className="panel-head">
+                <h2>
+                  <Server size={15} />
+                  MCP 服务
+                </h2>
+                <span className={mcpStatus?.running ? 'st-ok' : 'st-warn'}>
+                  {mcpStatus?.running ? '运行中' : '未运行'}
+                </span>
+              </div>
+              <div className="setting-row mcp-setting-row">
+                <div className="setting-label">
+                  <Code2 size={14} />
+                  <div>
+                    <strong>Streamable HTTP 地址</strong>
+                    <span className="hint">仅本机可访问</span>
+                  </div>
+                </div>
+                <div className="path-row mcp-value-row">
+                  <input
+                    className="path-input"
+                    readOnly
+                    value={`http://${mcpStatus?.host || '127.0.0.1'}:${mcpStatus?.port || 5032}/mcp`}
+                    aria-label="MCP 服务地址"
+                  />
+                  <button
+                    className="ghost-btn icon-btn-sm"
+                    type="button"
+                    title="复制 MCP 服务地址"
+                    aria-label="复制 MCP 服务地址"
+                    onClick={() => void copyText(`http://${mcpStatus?.host || '127.0.0.1'}:${mcpStatus?.port || 5032}/mcp`, 'MCP 地址')}
+                  >
+                    <Copy size={14} />
+                  </button>
+                </div>
+              </div>
+              <div className="setting-row mcp-setting-row">
+                <div className="setting-label">
+                  <KeyRound size={14} />
+                  <div>
+                    <strong>认证 token</strong>
+                    <span className="hint">以 Bearer token 方式认证，本机加密保存</span>
+                  </div>
+                </div>
+                <div className="mcp-token-controls">
+                  <div className="path-row mcp-value-row">
+                    <input
+                      className="path-input"
+                      type={showMcpToken ? 'text' : 'password'}
+                      readOnly
+                      value={mcpToken || (mcpStatus?.tokenConfigured ? '••••••••••••••••••••••••••••••••' : '')}
+                      placeholder="尚未生成"
+                      aria-label="MCP 认证 token"
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                    <button
+                      className="ghost-btn icon-btn-sm"
+                      type="button"
+                      disabled={mcpBusy}
+                      onClick={() => void revealMcpToken()}
+                      title={showMcpToken ? '隐藏 token' : '显示 token'}
+                      aria-label={showMcpToken ? '隐藏 token' : '显示 token'}
+                    >
+                      {showMcpToken ? <EyeOff size={14} /> : <Eye size={14} />}
+                    </button>
+                    <button
+                      className="ghost-btn icon-btn-sm"
+                      type="button"
+                      disabled={mcpBusy}
+                      onClick={() => void copyMcpToken()}
+                      title="复制 token"
+                      aria-label="复制 token"
+                    >
+                      <Copy size={14} />
+                    </button>
+                  </div>
+                  <button className="secondary-btn" type="button" disabled={mcpBusy} onClick={() => void regenerateMcpToken()}>
+                    <RefreshCw size={14} />
+                    重新生成
+                  </button>
+                </div>
               </div>
             </section>
 

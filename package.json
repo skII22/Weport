@@ -33,6 +33,7 @@
     "electron-store": "^11.0.2",
     "electron-updater": "^6.8.9",
     "exceljs": "^4.4.0",
+    "ffmpeg-static": "^5.3.0",
     "fzstd": "^0.1.1",
     "html2canvas": "^1.4.1",
     "koffi": "^3.1.0",
@@ -185,6 +186,7 @@
       ]
     },
     "nsis": {
+      "include": "build/installer.nsh",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
@@ -202,6 +204,7 @@
     "asar": true,
     "asarUnpack": [
       "node_modules/@hicccc77/electron-liquid-glass/**/*",
+      "node_modules/ffmpeg-static/**/*",
       "node_modules/koffi/**/*",
       "node_modules/silk-wasm/**/*",
       "resources/wedecrypt/**/*.node"

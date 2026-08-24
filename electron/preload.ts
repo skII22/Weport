@@ -84,6 +84,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getStatus: () => ipcRenderer.invoke('http:getStatus')
   },
 
+  // 本地 MCP 服务（v0.9.5）
+  mcp: {
+    getStatus: () => ipcRenderer.invoke('mcp:getStatus'),
+    getToken: () => ipcRenderer.invoke('mcp:getToken'),
+    regenerateToken: () => ipcRenderer.invoke('mcp:regenerateToken')
+  },
+
   // Windows Hello（v0.9.4 认证能力）
   auth: {
     verifyHello: (message?: string) => ipcRenderer.invoke('auth:verifyHello', message)

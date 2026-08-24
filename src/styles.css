@@ -2040,6 +2040,39 @@ button:disabled {
   font-size: 11.5px;
 }
 
+.mcp-setting-row {
+  align-items: flex-start;
+}
+
+.mcp-value-row {
+  width: min(520px, 58vw);
+}
+
+.mcp-token-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
+.mcp-token-controls .mcp-value-row {
+  width: min(430px, 48vw);
+}
+
+@media (max-width: 760px) {
+  .mcp-setting-row,
+  .mcp-token-controls {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .mcp-value-row,
+  .mcp-token-controls .mcp-value-row {
+    width: 100%;
+  }
+}
+
 .switch {
   position: relative;
   flex-shrink: 0;

@@ -7,6 +7,7 @@ import * as http from 'http'
 import * as https from 'https'
 import crypto from 'crypto'
 import { fileURLToPath } from 'url'
+import { nativeImage } from 'electron'
 import ExcelJS from 'exceljs'
 import { getEmojiPath } from 'wechat-emojis'
 import { ConfigService } from '../../config'
@@ -432,7 +433,14 @@ export class ExportContext {
           cacheMissFiles: 0,
           cacheFillFiles: 0,
           dedupReuseFiles: 0,
-          bytesWritten: 0
+          bytesWritten: 0,
+          imageBestSourceFiles: 0,
+          imageOriginalFiles: 0,
+          imageHdFiles: 0,
+          imageMiddleFiles: 0,
+          imageUnknownBestFiles: 0,
+          imageThumbnailFiles: 0,
+          imageUpgradedFiles: 0
         }
     }
 
@@ -500,7 +508,14 @@ export class ExportContext {
           mediaCacheMissFiles: stats.cacheMissFiles,
           mediaCacheFillFiles: stats.cacheFillFiles,
           mediaDedupReuseFiles: stats.dedupReuseFiles,
-          mediaBytesWritten: stats.bytesWritten
+          mediaBytesWritten: stats.bytesWritten,
+          imageBestSourceFiles: stats.imageBestSourceFiles,
+          imageOriginalFiles: stats.imageOriginalFiles,
+          imageHdFiles: stats.imageHdFiles,
+          imageMiddleFiles: stats.imageMiddleFiles,
+          imageUnknownBestFiles: stats.imageUnknownBestFiles,
+          imageThumbnailFiles: stats.imageThumbnailFiles,
+          imageUpgradedFiles: stats.imageUpgradedFiles
         }
     }
 
@@ -528,6 +543,34 @@ export class ExportContext {
 
         if (Number.isFinite(delta.bytesWritten)) {
           this.mediaExportTelemetry.bytesWritten += Math.max(0, Math.floor(Number(delta.bytesWritten || 0)))
+        }
+
+        if (Number.isFinite(delta.imageBestSourceFiles)) {
+          this.mediaExportTelemetry.imageBestSourceFiles += Math.max(0, Math.floor(Number(delta.imageBestSourceFiles || 0)))
+        }
+
+        if (Number.isFinite(delta.imageOriginalFiles)) {
+          this.mediaExportTelemetry.imageOriginalFiles += Math.max(0, Math.floor(Number(delta.imageOriginalFiles || 0)))
+        }
+
+        if (Number.isFinite(delta.imageHdFiles)) {
+          this.mediaExportTelemetry.imageHdFiles += Math.max(0, Math.floor(Number(delta.imageHdFiles || 0)))
+        }
+
+        if (Number.isFinite(delta.imageMiddleFiles)) {
+          this.mediaExportTelemetry.imageMiddleFiles += Math.max(0, Math.floor(Number(delta.imageMiddleFiles || 0)))
+        }
+
+        if (Number.isFinite(delta.imageUnknownBestFiles)) {
+          this.mediaExportTelemetry.imageUnknownBestFiles += Math.max(0, Math.floor(Number(delta.imageUnknownBestFiles || 0)))
+        }
+
+        if (Number.isFinite(delta.imageThumbnailFiles)) {
+          this.mediaExportTelemetry.imageThumbnailFiles += Math.max(0, Math.floor(Number(delta.imageThumbnailFiles || 0)))
+        }
+
+        if (Number.isFinite(delta.imageUpgradedFiles)) {
+          this.mediaExportTelemetry.imageUpgradedFiles += Math.max(0, Math.floor(Number(delta.imageUpgradedFiles || 0)))
         }
     }
 
@@ -625,9 +668,9 @@ export class ExportContext {
         return code === 'EXDEV' || code === 'EPERM' || code === 'EACCES' || code === 'EINVAL' || code === 'ENOSYS' || code === 'ENOTSUP'
     }
 
-    private async copyMediaWithCacheAndDedup(kind: 'image' | 'video' | 'emoji', sourcePath: string, destPath: string, control?: ExportTaskControl, options?: Pick<ExportOptions, 'exportConflictStrategy'>): Promise<{ success: boolean; code?: string }> {
+    private async copyMediaWithCacheAndDedup(kind: 'image' | 'video' | 'emoji', sourcePath: string, destPath: string, control?: ExportTaskControl, options?: Pick<ExportOptions, 'exportConflictStrategy'>, replaceIncrementalExisting = false): Promise<{ success: boolean; code?: string }> {
         const existedBeforeCopy = await pathExists(destPath);
-        if (existedBeforeCopy && this.shouldReuseExistingExportFile(options)) {
+        if (existedBeforeCopy && this.shouldReuseExistingExportFile(options) && !replaceIncrementalExisting) {
           this.noteMediaTelemetry({
             doneFiles: 1,
             dedupReuseFiles: 1
@@ -642,7 +685,7 @@ export class ExportContext {
         }
 
         const dedupeKey = resolved.dedupeKey;
-        if (dedupeKey) {
+        if (dedupeKey && !(existedBeforeCopy && replaceIncrementalExisting)) {
           const reusedPath = this.mediaRunSourceDedupMap.get(dedupeKey)
           if (reusedPath && reusedPath !== destPath && await pathExists(reusedPath)) {
             const reused = await hardlinkOrCopyFile(reusedPath, destPath)
@@ -659,7 +702,7 @@ export class ExportContext {
           }
         }
 
-        const copied = resolved.cacheHit
+        const copied = resolved.cacheHit && !(existedBeforeCopy && replaceIncrementalExisting)
                   ? await hardlinkOrCopyFile(resolved.sourcePath, destPath)
                   : await copyFileOptimized(resolved.sourcePath, destPath);
         if (!copied.success) return copied
@@ -676,6 +719,54 @@ export class ExportContext {
         }
 
         return { success: true }
+    }
+
+    private getImageQuality(buffer: Buffer): { pixels: number; bytes: number } | null {
+        try {
+          const image = nativeImage.createFromBuffer(buffer)
+          if (image.isEmpty()) return null
+          const size = image.getSize()
+          if (size.width <= 0 || size.height <= 0) return null
+          return { pixels: size.width * size.height, bytes: buffer.length }
+        } catch {
+          return null
+        }
+    }
+
+    private async shouldUpgradeExportedImage(source: string | Buffer, destPath: string): Promise<boolean> {
+        if (!await pathExists(destPath)) return true
+        try {
+          const [sourceBuffer, destBuffer] = await Promise.all([
+            typeof source === 'string' ? fs.promises.readFile(source) : Promise.resolve(source),
+            fs.promises.readFile(destPath)
+          ])
+          const sourceQuality = this.getImageQuality(sourceBuffer)
+          const destQuality = this.getImageQuality(destBuffer)
+          if (!sourceQuality) return false
+          if (!destQuality) return true
+          if (sourceQuality.pixels !== destQuality.pixels) {
+            return sourceQuality.pixels > destQuality.pixels
+          }
+          return sourceQuality.bytes > destQuality.bytes
+        } catch {
+          return false
+        }
+    }
+
+    private async findExistingImageExportSibling(basePath: string): Promise<string | null> {
+        for (const ext of ['.png', '.jpg', '.jpeg', '.webp', '.gif']) {
+          const candidate = `${basePath}${ext}`
+          if (await pathExists(candidate)) return candidate
+        }
+        return null
+    }
+
+    private async removeOtherImageExportSiblings(basePath: string, keepPath: string): Promise<void> {
+        for (const ext of ['.png', '.jpg', '.jpeg', '.webp', '.gif']) {
+          const candidate = `${basePath}${ext}`
+          if (path.resolve(candidate) === path.resolve(keepPath)) continue
+          await fs.promises.rm(candidate, { force: true }).catch(() => { })
+        }
     }
 
     public triggerMediaFileCacheCleanup(force = false): void {
@@ -3066,6 +3157,20 @@ export class ExportContext {
         try {
           const imagesDir = path.join(mediaRootDir, mediaRelativePrefix, 'images')
           await ensureExportDir(imagesDir, control, dirCache)
+          const expectedSizes = this.extractImageExpectedSizes(msg)
+
+          const noteImageQuality = (result: any): void => {
+            if (result?.isThumb || result?.qualityKind === 'thumbnail') {
+              this.noteMediaTelemetry({ imageThumbnailFiles: 1 })
+              return
+            }
+            const delta: Partial<MediaExportTelemetry> = { imageBestSourceFiles: 1 }
+            if (result?.qualityKind === 'original') delta.imageOriginalFiles = 1
+            else if (result?.qualityKind === 'hd') delta.imageHdFiles = 1
+            else if (result?.qualityKind === 'middle') delta.imageMiddleFiles = 1
+            else delta.imageUnknownBestFiles = 1
+            this.noteMediaTelemetry(delta)
+          }
 
           const tryResolveImagePath = async (imageMd5?: string, imageDatName?: string): Promise<string | null> => {
             if (!imageMd5 && !imageDatName) return null
@@ -3086,14 +3191,10 @@ export class ExportContext {
                   hardlinkOnly: true,
                   disableUpdateCheck: true,
                   allowCacheIndex: true,
+                  ...expectedSizes,
                   suppressEvents: true
                 })
                 return pickResolvedImagePath(cachedResult)
-              }
-
-              const cachedPath = await resolveCachedPath(imageMd5, imageDatName)
-              if (cachedPath) {
-                return cachedPath
               }
 
               const decryptResult = await imageDecryptService.decryptImage({
@@ -3101,13 +3202,24 @@ export class ExportContext {
                 imageMd5,
                 imageDatName,
                 createTime: msg.createTime,
-                force: false,
+                force: true,
                 preferFilePath: true,
                 hardlinkOnly: true,
-                allowCacheIndex: true
+                allowCacheIndex: true,
+                ...expectedSizes
               })
               const decryptedPath = pickResolvedImagePath(decryptResult)
-              if (decryptedPath) return decryptedPath
+              if (decryptedPath) {
+                noteImageQuality(decryptResult)
+                return decryptedPath
+              }
+
+              const cachedPath = await resolveCachedPath(imageMd5, imageDatName)
+              if (cachedPath) {
+                const isThumbnail = /(?:_t|_thumb)(?:\.[a-z0-9]+)?$/i.test(path.basename(cachedPath))
+                noteImageQuality({ isThumb: isThumbnail, qualityKind: isThumbnail ? 'thumbnail' : 'unknown' })
+                return cachedPath
+              }
 
               const localId = Number(msg?.localId || 0)
               if (Number.isFinite(localId) && localId > 0) {
@@ -3115,6 +3227,7 @@ export class ExportContext {
                 if (fallback.success && fallback.data) {
                   const buffer = Buffer.from(fallback.data, 'base64')
                   const mime = this.detectMimeType(buffer) || 'image/jpeg'
+                  noteImageQuality({ qualityKind: 'unknown' })
                   return `data:${mime};base64,${fallback.data}`
                 }
               }
@@ -3125,21 +3238,6 @@ export class ExportContext {
                 console.log(`[Export] 图片本地无数据 (localId=${msg.localId}): imageMd5=${imageMd5 || ''}, imageDatName=${imageDatName || ''}, error=${decryptResult.error || '未知'}`)
               }
 
-              const thumbResult = await imageDecryptService.resolveCachedImage({
-                sessionId,
-                imageMd5,
-                imageDatName,
-                createTime: msg.createTime,
-                preferFilePath: true,
-                hardlinkOnly: true,
-                disableUpdateCheck: true,
-                allowCacheIndex: true,
-                suppressEvents: true
-              })
-              if (thumbResult.success && thumbResult.localPath) {
-                console.log(`[Export] 使用缩略图替代 (localId=${msg.localId}): ${thumbResult.localPath}`)
-                return thumbResult.localPath
-              }
               return null
             })
           }
@@ -3184,18 +3282,26 @@ export class ExportContext {
             const ext = this.getExtFromDataUrl(sourcePath)
             const fileName = `${messageId}_${imageKey}${ext}`
             const destPath = path.join(imagesDir, fileName)
+            const destBasePath = path.join(imagesDir, `${messageId}_${imageKey}`)
+            const existingPath = await this.findExistingImageExportSibling(destBasePath)
 
-            if (await pathExists(destPath) && this.shouldReuseExistingExportFile(options)) {
+            const buffer = Buffer.from(base64Data, 'base64')
+            const shouldUpgrade = this.shouldReuseExistingExportFile(options) && Boolean(existingPath)
+              && await this.shouldUpgradeExportedImage(buffer, existingPath as string)
+            if (shouldUpgrade && existingPath) {
+              this.noteMediaTelemetry({ imageUpgradedFiles: 1 })
+            }
+            if (existingPath && this.shouldReuseExistingExportFile(options) && !shouldUpgrade) {
               this.noteMediaTelemetry({ doneFiles: 1, dedupReuseFiles: 1 })
               return {
-                relativePath: path.posix.join(mediaRelativePrefix, 'images', fileName),
+                relativePath: path.posix.join(mediaRelativePrefix, 'images', path.basename(existingPath)),
                 kind: 'image'
               }
             }
 
-            const buffer = Buffer.from(base64Data, 'base64')
             await this.recordCreatedFileBeforeWrite(destPath, control)
             await fs.promises.writeFile(destPath, buffer)
+            if (shouldUpgrade) await this.removeOtherImageExportSiblings(destBasePath, destPath)
             this.noteMediaTelemetry({
               doneFiles: 1,
               cacheMissFiles: 1,
@@ -3214,7 +3320,21 @@ export class ExportContext {
           const ext = path.extname(sourcePath) || '.jpg'
           const fileName = `${messageId}_${imageKey}${ext}`
           const destPath = path.join(imagesDir, fileName)
-          const copied = await this.copyMediaWithCacheAndDedup('image', sourcePath, destPath, control, options)
+          const destBasePath = path.join(imagesDir, `${messageId}_${imageKey}`)
+          const existingPath = await this.findExistingImageExportSibling(destBasePath)
+          const shouldUpgrade = this.shouldReuseExistingExportFile(options) && Boolean(existingPath)
+            && await this.shouldUpgradeExportedImage(sourcePath, existingPath as string)
+          if (shouldUpgrade && existingPath) {
+            this.noteMediaTelemetry({ imageUpgradedFiles: 1 })
+          }
+          if (existingPath && this.shouldReuseExistingExportFile(options) && !shouldUpgrade) {
+            this.noteMediaTelemetry({ doneFiles: 1, dedupReuseFiles: 1 })
+            return {
+              relativePath: path.posix.join(mediaRelativePrefix, 'images', path.basename(existingPath)),
+              kind: 'image'
+            }
+          }
+          const copied = await this.copyMediaWithCacheAndDedup('image', sourcePath, destPath, control, options, shouldUpgrade)
           if (!copied.success) {
             if (copied.code === 'ENOENT') {
               console.log(`[Export] 源图片文件不存在 (localId=${msg.localId}): ${sourcePath} → 将显示 [图片] 占位符`)
@@ -3223,6 +3343,7 @@ export class ExportContext {
             }
             return null
           }
+          if (shouldUpgrade) await this.removeOtherImageExportSiblings(destBasePath, destPath)
 
           return {
             relativePath: path.posix.join(mediaRelativePrefix, 'images', fileName),
@@ -3231,6 +3352,27 @@ export class ExportContext {
         } catch (e) {
           console.error(`[Export] 导出图片异常 (localId=${msg.localId}):`, e, `→ 将显示 [图片] 占位符`)
           return null
+        }
+    }
+
+    private extractImageExpectedSizes(msg: any): {
+      expectedOriginalBytes?: number
+      expectedHdBytes?: number
+      expectedHevcMidBytes?: number
+    } {
+        const xml = String(msg?.rawContent || msg?.content || '')
+        const readPositiveInt = (names: string[]): number | undefined => {
+          for (const name of names) {
+            const raw = extractXmlAttribute(xml, 'img', name) || extractXmlValue(xml, name)
+            const value = Number.parseInt(String(raw || ''), 10)
+            if (Number.isFinite(value) && value > 0) return value
+          }
+          return undefined
+        }
+        return {
+          expectedOriginalBytes: readPositiveInt(['length']),
+          expectedHdBytes: readPositiveInt(['hdlength', 'hd_length']),
+          expectedHevcMidBytes: readPositiveInt(['hevc_mid_size', 'hevcmidsize'])
         }
     }
 
@@ -3510,10 +3652,20 @@ export class ExportContext {
 
           const sourcePath = videoInfo.videoUrl
           if (!sourcePath) return null
-          const fileName = path.basename(sourcePath)
+          const sourceFileName = path.basename(sourcePath)
+          const isRawVideo = /_raw\.mp4$/i.test(sourceFileName)
+          const fileName = sourceFileName.replace(/_raw(?=\.mp4$)/i, '')
           const destPath = path.join(videosDir, fileName)
 
-          const copied = await this.copyMediaWithCacheAndDedup('video', sourcePath, destPath, control, options)
+          const replaceIncrementalExisting = this.shouldReuseExistingExportFile(options) && isRawVideo
+          const copied = await this.copyMediaWithCacheAndDedup(
+            'video',
+            sourcePath,
+            destPath,
+            control,
+            options,
+            replaceIncrementalExisting
+          )
           if (!copied.success) return null
 
           return {

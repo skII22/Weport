@@ -55,6 +55,8 @@ type DecryptResult = {
   error?: string
   failureKind?: 'not_found' | 'decrypt_failed'
   isThumb?: boolean  // 是否是缩略图（没有高清图时返回缩略图）
+  qualityTier?: number
+  qualityKind?: 'original' | 'hd' | 'middle' | 'thumbnail' | 'local_best' | 'unknown'
 }
 
 type DecryptProgressStage = 'queued' | 'locating' | 'decrypting' | 'writing' | 'done' | 'failed'
@@ -71,6 +73,9 @@ type CachedImagePayload = {
   allowCachePromotion?: boolean
   allowFilesystemScan?: boolean
   suppressEvents?: boolean
+  expectedOriginalBytes?: number
+  expectedHdBytes?: number
+  expectedHevcMidBytes?: number
 }
 
 type DecryptImagePayload = CachedImagePayload & {
@@ -158,12 +163,12 @@ export class ImageDecryptService {
   }
 
   private logError(message: string, error?: unknown, meta?: Record<string, unknown>): void {
+    console.error(`[ImageDecrypt] ${message}`, error, meta)
     if (!this.configService.get('logEnabled')) return
     const timestamp = new Date().toISOString()
     const errorStr = error ? ` Error: ${String(error)}` : ''
     const metaStr = meta ? ` ${JSON.stringify(meta)}` : ''
     const logLine = `[${timestamp}] [ImageDecrypt] ERROR: ${message}${errorStr}${metaStr}\n`
-    console.error(message, error, meta)
     this.writeLog(logLine)
   }
 
@@ -305,24 +310,6 @@ export class ImageDecryptService {
       return { success: false, error: '缺少图片标识', failureKind: 'not_found' }
     }
     this.emitDecryptProgress(payload, cacheKey, 'queued', 4, 'running')
-
-    if (payload.force) {
-      for (const key of cacheKeys) {
-        const cached = this.getResolvedMediaCache(payload, key)
-        if (cached && existsSync(cached) && this.isUsableImageCacheFile(cached) && this.isHdPath(cached)) {
-          this.cacheResolvedPaths(payload, cacheKey, cached)
-          this.clearUpdateFlags(payload, cacheKey)
-          const localPath = this.resolveLocalPathForPayload(cached, payload.preferFilePath)
-          this.emitCacheResolved(payload, cacheKey, this.resolveEmitPath(cached, payload.preferFilePath))
-          this.emitDecryptProgress(payload, cacheKey, 'done', 100, 'done')
-          return { success: true, localPath }
-        }
-        if (cached && !this.isUsableImageCacheFile(cached)) {
-          this.deleteResolvedMediaCache(payload, key)
-        }
-      }
-
-    }
 
     if (!payload.force) {
       const cached = this.getResolvedMediaCache(payload, cacheKey)
@@ -474,7 +461,7 @@ export class ImageDecryptService {
       let usedHdAttempt = false
       let fallbackToThumbnail = false
 
-      // force=true 时先尝试高清；若高清缺失则回退到缩略图，避免直接失败。
+      // force=true 时先尝试所有非缩略图来源；若缺失才回退到缩略图。
       if (payload.force) {
         usedHdAttempt = true
         datPath = await this.resolveDatPath(
@@ -508,7 +495,7 @@ export class ImageDecryptService {
           )
           fallbackToThumbnail = Boolean(datPath)
           if (fallbackToThumbnail) {
-            this.logInfo('高清缺失，回退解密缩略图', {
+            this.logInfo('非缩略图来源缺失，回退解密缩略图', {
               md5: payload.imageMd5,
               datName: payload.imageDatName
             })
@@ -555,15 +542,26 @@ export class ImageDecryptService {
       const preferHdCache = Boolean(payload.force && !fallbackToThumbnail)
       const existingFast = this.findCachedOutputByDatPath(datPath, payload.sessionId, preferHdCache)
       if (existingFast) {
-        this.logInfo('找到已解密文件(按DAT快速命中)', { existing: existingFast, isHd: this.isHdPath(existingFast) })
-        const isHd = this.isHdPath(existingFast)
-        if (!(payload.force && !isHd)) {
+        const sourceTier = this.getDatTier(datPath, this.normalizeDatBase(basename(datPath)))
+        const cacheTier = this.getCachedPathTier(existingFast)
+        const qualityKind = this.classifyImageQuality(datPath, existingFast, payload)
+        const needsLosslessUpgrade = payload.force === true &&
+          (qualityKind === 'middle' || this.isHdDatPath(datPath)) &&
+          /\.jpe?g$/i.test(existingFast)
+        this.logInfo('找到已解密文件(按DAT快速命中)', {
+          existing: existingFast,
+          sourceTier,
+          cacheTier,
+          qualityKind,
+          needsLosslessUpgrade
+        })
+        if (!(payload.force && cacheTier < sourceTier) && !needsLosslessUpgrade) {
           this.cacheResolvedPaths(payload, cacheKey, existingFast)
           const localPath = this.resolveLocalPathForPayload(existingFast, payload.preferFilePath)
           const isThumb = this.isThumbnailPath(existingFast)
           this.emitCacheResolved(payload, cacheKey, this.resolveEmitPath(existingFast, payload.preferFilePath))
           this.emitDecryptProgress(payload, cacheKey, 'done', 100, 'done')
-          return { success: true, localPath, isThumb }
+          return { success: true, localPath, isThumb, qualityTier: cacheTier, qualityKind }
         }
       }
 
@@ -609,6 +607,15 @@ export class ImageDecryptService {
 
       // 如果解密产物无法识别为图片，归类为“解密失败”。
       if (!detectedExt) {
+        console.error('[ImageDecrypt] decrypted output is not a supported image', {
+          datVariant: this.getCacheVariantSuffixFromDat(datPath) || 'base',
+          encryptedBytes: this.fileSizeSafe(datPath),
+          decryptedBytes: decrypted.length,
+          nativeExt: nativeResult.ext || 'unknown',
+          nativeWxgf: nativeResult.isWxgf,
+          unwrapStillWxgf: wxgfResult.isWxgf,
+          ffmpegAvailable: Boolean(getStaticFfmpegPath())
+        })
         this.emitDecryptProgress(payload, cacheKey, 'failed', 100, 'error', '解密后不是有效图片')
         return {
           success: false,
@@ -642,7 +649,13 @@ export class ImageDecryptService {
       const emitPath = this.resolveEmitPath(outputPath, payload.preferFilePath)
       this.emitCacheResolved(payload, cacheKey, emitPath)
       this.emitDecryptProgress(payload, cacheKey, 'done', 100, 'done')
-      return { success: true, localPath, isThumb }
+      return {
+        success: true,
+        localPath,
+        isThumb,
+        qualityTier: this.getDatTier(datPath, this.normalizeDatBase(basename(datPath))),
+        qualityKind: this.classifyImageQuality(datPath, outputPath, payload, wxgfResult.convertedFromWxgf)
+      }
     } catch (e) {
       this.logError('解密失败', e, { md5: payload.imageMd5, datName: payload.imageDatName })
       this.emitDecryptProgress(payload, cacheKey, 'failed', 100, 'error', String(e))
@@ -772,8 +785,14 @@ export class ImageDecryptService {
         const scopedKey = `${accountDir}|${cacheKey}`
         const cached = this.getResolvedCache(scopedKey)
         if (!cached || !existsSync(cached)) continue
-        if (!allowThumbnail && !this.isHdDatPath(cached)) continue
-        return cached
+        const cachedBase = this.normalizeDatBase(basename(cached))
+        const selectedPath = this.selectBestDatCandidate(
+          [cached, ...this.collectSiblingDatCandidates(cached, cachedBase)],
+          cachedBase,
+          allowThumbnail
+        )
+        if (!selectedPath) continue
+        return selectedPath
       }
     }
 
@@ -782,14 +801,16 @@ export class ImageDecryptService {
         if (!this.looksLikeMd5(baseMd5)) continue
         const hardlinkPath = await this.resolveHardlinkPath(accountDir, baseMd5, sessionId)
         if (!hardlinkPath) continue
-        if (!allowThumbnail && !this.isHdDatPath(hardlinkPath)) continue
-        this.cacheDatPath(accountDir, baseMd5, hardlinkPath)
-        if (imageMd5) this.cacheDatPath(accountDir, imageMd5, hardlinkPath)
-        if (imageDatName) this.cacheDatPath(accountDir, imageDatName, hardlinkPath)
-        const normalizedFileName = basename(hardlinkPath).toLowerCase()
-        if (normalizedFileName) this.cacheDatPath(accountDir, normalizedFileName, hardlinkPath)
+        const siblingCandidates = this.collectSiblingDatCandidates(hardlinkPath, baseMd5)
+        const selectedPath = this.selectBestDatCandidate([hardlinkPath, ...siblingCandidates], baseMd5, allowThumbnail)
+        if (!selectedPath) continue
+        this.cacheDatPath(accountDir, baseMd5, selectedPath)
+        if (imageMd5) this.cacheDatPath(accountDir, imageMd5, selectedPath)
+        if (imageDatName) this.cacheDatPath(accountDir, imageDatName, selectedPath)
+        const normalizedFileName = basename(selectedPath).toLowerCase()
+        if (normalizedFileName) this.cacheDatPath(accountDir, normalizedFileName, selectedPath)
         this.datNameScanMissAt.delete(missKey)
-        return hardlinkPath
+        return selectedPath
       }
     }
 
@@ -1105,39 +1126,34 @@ export class ImageDecryptService {
     const candidates = this.collectAllDatCandidatesForBase(accountDir, baseMd5, sessionId, createTime)
     if (candidates.length === 0) return null
 
-    const imgCandidates = candidates.filter((item) => this.isImgScopedDatPath(item))
-    const imgHdCandidates = imgCandidates.filter((item) => this.isHdDatPath(item))
-    const hdInImg = this.pickLargestDatPath(imgHdCandidates)
-    if (hdInImg) return hdInImg
+    return this.selectBestDatCandidate(candidates, baseMd5, allowThumbnail)
+  }
 
-    if (!allowThumbnail) {
-      // 高清优先仅认 img/image/msgimg 路径中的 H 变体；
-      // 若该范围没有，则交由 allowThumbnail=true 的回退分支按 base.dat/_t 继续挑选。
-      return null
+  private collectSiblingDatCandidates(datPath: string, baseMd5: string): string[] {
+    try {
+      return readdirSync(dirname(datPath), { withFileTypes: true })
+        .filter((entry) => entry.isFile() && this.isHardlinkCandidateName(entry.name, baseMd5))
+        .map((entry) => join(dirname(datPath), entry.name))
+    } catch {
+      return []
     }
+  }
 
-    // 无 H 时，优先尝试原始无后缀 DAT（{md5}.dat）。
-    const baseDatInImg = this.pickLargestDatPath(
-      imgCandidates.filter((item) => this.isBaseDatPath(item, baseMd5))
-    )
-    if (baseDatInImg) return baseDatInImg
-
-    const baseDatAny = this.pickLargestDatPath(
-      candidates.filter((item) => this.isBaseDatPath(item, baseMd5))
-    )
-    if (baseDatAny) return baseDatAny
-
-    const thumbDatInImg = this.pickLargestDatPath(
-      imgCandidates.filter((item) => this.isTVariantDat(item))
-    )
-    if (thumbDatInImg) return thumbDatInImg
-
-    const thumbDatAny = this.pickLargestDatPath(
-      candidates.filter((item) => this.isTVariantDat(item))
-    )
-    if (thumbDatAny) return thumbDatAny
-
-    return null
+  private selectBestDatCandidate(paths: string[], baseMd5: string, allowThumbnail: boolean): string | null {
+    const candidates = Array.from(new Set(paths.filter((item) => existsSync(item))))
+      .filter((item) => allowThumbnail || this.getDatTier(item, baseMd5) > 1)
+    candidates.sort((a, b) => {
+      const tierDiff = this.getDatTier(b, baseMd5) - this.getDatTier(a, baseMd5)
+      if (tierDiff !== 0) return tierDiff
+      const scopeDiff = Number(this.isImgScopedDatPath(b)) - Number(this.isImgScopedDatPath(a))
+      if (scopeDiff !== 0) return scopeDiff
+      const sizeDiff = this.fileSizeSafe(b) - this.fileSizeSafe(a)
+      if (sizeDiff !== 0) return sizeDiff
+      const mtimeDiff = this.fileMtimeSafe(b) - this.fileMtimeSafe(a)
+      if (mtimeDiff !== 0) return mtimeDiff
+      return a.localeCompare(b)
+    })
+    return candidates[0] || null
   }
 
   private resolveDatPathFromParsedDatName(
@@ -1583,7 +1599,8 @@ export class ImageDecryptService {
     const normalizedBase = this.normalizeDatBase(base)
     const primarySuffix = this.getCacheVariantSuffixFromDat(datPath)
     const suffixes = this.buildCacheSuffixSearchOrder(primarySuffix, preferHd)
-    const extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp']
+    // Lossless wxgf conversions use PNG. Prefer them over legacy JPEG conversions.
+    const extensions = ['.png', '.jpg', '.jpeg', '.gif', '.webp']
 
     const root = this.getCacheRoot()
     const contactDir = this.sanitizeDirName(sessionId || 'unknown')
@@ -1633,9 +1650,19 @@ export class ImageDecryptService {
     const candidates = this.buildCacheOutputCandidatesFromDat(datPath, sessionId, preferHd)
     for (const candidate of candidates) {
       if (!existsSync(candidate)) continue
+      if (preferHd && this.isAmbiguousLegacyBaseCache(candidate, datPath, sessionId)) continue
       if (this.isUsableImageCacheFile(candidate)) return candidate
     }
     return null
+  }
+
+  private isAmbiguousLegacyBaseCache(cachePath: string, datPath: string, sessionId?: string): boolean {
+    if (this.getCacheVariantSuffixFromCachedPath(cachePath)) return false
+    const normalizedBase = this.normalizeDatBase(basename(datPath))
+    const root = this.getCacheRoot()
+    const currentDir = join(root, this.sanitizeDirName(sessionId || 'unknown'), this.resolveTimeDir(datPath))
+    const parent = dirname(cachePath)
+    return parent !== currentDir && (parent === root || parent === join(root, normalizedBase))
   }
 
   private cacheResolvedPaths(
@@ -2277,22 +2304,22 @@ export class ImageDecryptService {
    * 解包 wxgf 格式
    * wxgf 是微信的图片格式，内部使用 HEVC 编码
    */
-  private async unwrapWxgf(buffer: Buffer): Promise<{ data: Buffer; isWxgf: boolean }> {
+  private async unwrapWxgf(buffer: Buffer): Promise<{ data: Buffer; isWxgf: boolean; convertedFromWxgf: boolean }> {
     // 检查是否是 wxgf 格式 (77 78 67 66 = "wxgf")
     if (buffer.length < 20 ||
       buffer[0] !== 0x77 || buffer[1] !== 0x78 ||
       buffer[2] !== 0x67 || buffer[3] !== 0x66) {
-      return { data: buffer, isWxgf: false }
+      return { data: buffer, isWxgf: false, convertedFromWxgf: false }
     }
 
     // 先尝试搜索内嵌的传统图片签名
     for (let i = 4; i < Math.min(buffer.length - 12, 4096); i++) {
       if (buffer[i] === 0xff && buffer[i + 1] === 0xd8 && buffer[i + 2] === 0xff) {
-        return { data: buffer.subarray(i), isWxgf: false }
+        return { data: buffer.subarray(i), isWxgf: false, convertedFromWxgf: false }
       }
       if (buffer[i] === 0x89 && buffer[i + 1] === 0x50 &&
         buffer[i + 2] === 0x4e && buffer[i + 3] === 0x47) {
-        return { data: buffer.subarray(i), isWxgf: false }
+        return { data: buffer.subarray(i), isWxgf: false, convertedFromWxgf: false }
       }
     }
 
@@ -2304,16 +2331,16 @@ export class ImageDecryptService {
 
     for (const candidate of hevcCandidates) {
       try {
-        const jpgData = await this.convertHevcToJpg(candidate.data)
-        if (!jpgData || jpgData.length === 0) continue
-        return { data: jpgData, isWxgf: false }
+        const pngData = await this.convertHevcToPng(candidate.data)
+        if (!pngData || pngData.length === 0) continue
+        return { data: pngData, isWxgf: false, convertedFromWxgf: true }
       } catch (e) {
         this.logError('unwrapWxgf: 候选流转换失败', e, { candidate: candidate.name })
       }
     }
 
     const fallback = hevcCandidates[0]?.data || buffer.subarray(4)
-    return { data: fallback, isWxgf: true }
+    return { data: fallback, isWxgf: true, convertedFromWxgf: false }
   }
 
   private buildWxgfHevcCandidates(buffer: Buffer): Array<{ name: string; data: Buffer }> {
@@ -2447,9 +2474,9 @@ export class ImageDecryptService {
   }
 
   /**
-   * 使用 ffmpeg 将 HEVC 裸流转换为 JPG
+   * 使用 ffmpeg 将 HEVC 裸流转换为无损 PNG，避免在本地中质量流上再次引入 JPEG 损失。
    */
-  private async convertHevcToJpg(hevcData: Buffer): Promise<Buffer | null> {
+  private async convertHevcToPng(hevcData: Buffer): Promise<Buffer | null> {
     const ffmpeg = this.getFfmpegPath()
     this.logInfo('ffmpeg 转换开始', { ffmpegPath: ffmpeg, hevcSize: hevcData.length })
 
@@ -2457,7 +2484,7 @@ export class ImageDecryptService {
     if (!existsSync(tmpDir)) mkdirSync(tmpDir, { recursive: true })
     const uniqueId = `${process.pid}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`
     const tmpInput = join(tmpDir, `hevc_${uniqueId}.hevc`)
-    const tmpOutput = join(tmpDir, `hevc_${uniqueId}.jpg`)
+    const tmpOutput = join(tmpDir, `hevc_${uniqueId}.png`)
 
     try {
       await writeFile(tmpInput, hevcData)
@@ -2481,7 +2508,6 @@ export class ImageDecryptService {
 
         const result = await this.runFfmpegConvert(ffmpeg, attempt.inputArgs, tmpOutput, attempt.label, attempt.outputArgs)
         if (!result) continue
-        if (this.isLikelyCorruptedJpegBuffer(result)) continue
         return result
       }
 
@@ -2511,7 +2537,7 @@ export class ImageDecryptService {
         '-y',
         ...inputArgs,
         ...(outputArgs || []),
-        '-vframes', '1', '-q:v', '2', '-f', 'image2', tmpOutput
+        '-vframes', '1', '-c:v', 'png', '-compression_level', '6', '-pix_fmt', 'rgb24', '-f', 'image2', tmpOutput
       ]
       this.logInfo(`ffmpeg 尝试 [${label}]`, { args: args.join(' ') })
 
@@ -2532,10 +2558,10 @@ export class ImageDecryptService {
         clearTimeout(timer)
         if (code === 0 && existsSync(tmpOutput)) {
           try {
-            const jpgBuf = await readFile(tmpOutput)
-            if (jpgBuf.length > 0) {
-              this.logInfo(`ffmpeg [${label}] 成功`, { outputSize: jpgBuf.length })
-              resolve(jpgBuf)
+            const imageBuffer = await readFile(tmpOutput)
+            if (imageBuffer.length > 0) {
+              this.logInfo(`ffmpeg [${label}] 成功`, { outputSize: imageBuffer.length, format: 'png-lossless' })
+              resolve(imageBuffer)
               return
             }
           } catch (e) {
@@ -2589,21 +2615,46 @@ export class ImageDecryptService {
   }
 
   private getDatTier(datPath: string, baseMd5: string): number {
-    if (this.isHdDatPath(datPath)) return 3
-    if (this.isBaseDatPath(datPath, baseMd5)) return 2
+    if (this.isHdDatPath(datPath)) return 5
+    // WeChat 4.x commonly stores the HEVC middle-quality stream in base.dat.
+    if (this.isBaseDatPath(datPath, baseMd5)) return 4
+    const suffix = this.getCacheVariantSuffixFromDat(datPath).toLowerCase()
+    if (['_w', '.w', '_b', '.b', '_c', '.c'].includes(suffix)) return 3
     if (this.isTVariantDat(datPath)) return 1
-    return 0
+    return 2
   }
 
   private getCachedPathTier(cachePath: string): number {
-    if (this.isHdPath(cachePath)) return 3
+    if (this.isHdPath(cachePath)) return 5
     const suffix = this.getCacheVariantSuffixFromCachedPath(cachePath)
-    if (!suffix) return 2
+    if (!suffix) return 4
     const normalized = suffix.toLowerCase()
     if (normalized === '_t' || normalized === '.t' || normalized === '_thumb' || normalized === '.thumb') {
       return 1
     }
-    return 1
+    if (['_w', '.w', '_b', '.b', '_c', '.c'].includes(normalized)) return 3
+    return 2
+  }
+
+  private classifyImageQuality(
+    datPath: string,
+    outputPath: string,
+    payload: Pick<CachedImagePayload, 'expectedOriginalBytes' | 'expectedHdBytes' | 'expectedHevcMidBytes'>,
+    convertedFromWxgf = false
+  ): DecryptResult['qualityKind'] {
+    if (this.isThumbnailPath(datPath) || this.isThumbnailPath(outputPath)) return 'thumbnail'
+    const sourceBytes = this.fileSizeSafe(datPath)
+    if (convertedFromWxgf || this.isExpectedSourceSize(sourceBytes, payload.expectedHevcMidBytes)) return 'middle'
+    if (this.isHdDatPath(datPath) || this.isExpectedSourceSize(sourceBytes, payload.expectedHdBytes)) return 'hd'
+    if (this.isExpectedSourceSize(sourceBytes, payload.expectedOriginalBytes)) return 'original'
+    return 'local_best'
+  }
+
+  private isExpectedSourceSize(actualBytes: number, expectedBytes?: number): boolean {
+    const expected = Number(expectedBytes || 0)
+    if (!Number.isFinite(expected) || expected <= 0 || actualBytes <= 0) return false
+    // DAT wrappers add a small header; tolerate both that and minor format-version padding.
+    return Math.abs(actualBytes - expected) <= Math.max(4096, Math.floor(expected * 0.02))
   }
 
   private isHdPath(p: string): boolean {

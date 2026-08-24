@@ -112,25 +112,6 @@ export default function NotificationWindow() {
         handleClose()
     }
 
-    useEffect(() => {
-        if (!notification && !prevNotification) return
-
-        const timer = setTimeout(() => {
-            // 窗口必须精确贴合内容高度，多余区域会拦截桌面点击
-            const root = document.getElementById('notification-root')
-            if (root && window.electronAPI?.notification?.resize) {
-                const width = position === 'top-center' ? 280 : 344
-                const height = Math.min(Math.ceil(root.getBoundingClientRect().height), 300)
-                const last = lastSizeRef.current
-                if (last && last.width === width && last.height === height) return
-                lastSizeRef.current = { width, height }
-                window.electronAPI.notification.resize(width, height)
-            }
-        }, 50)
-
-        return () => clearTimeout(timer)
-    }, [notification, prevNotification, position])
-
     // 原生玻璃模式：卡片挂载后上报实测几何（窗口本地 CSS 像素 + 卡片本地亮度带），
     // 主进程据此创建/复用窗口下方的原生面板；参数与 LiquidGlass 的视觉参数一致
     useEffect(() => {

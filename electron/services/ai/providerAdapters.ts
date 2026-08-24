@@ -37,7 +37,15 @@ async function readError(response: Response): Promise<never> {
   let detail = raw
   try { detail = providerError(JSON.parse(raw)) || raw } catch { /* plain text */ }
   const error = new Error(detail || `HTTP ${response.status}`)
-  ;(error as Error & { status?: number }).status = response.status
+  const typedError = error as Error & { status?: number; responseMeta?: ProviderStreamResult['responseMeta'] }
+  typedError.status = response.status
+  typedError.responseMeta = {
+    status: response.status,
+    contentType: response.headers.get('content-type') || '',
+    bytes: new TextEncoder().encode(raw).byteLength,
+    events: 0,
+    parseMode: raw.trim() ? 'unknown' : 'empty',
+  }
   throw error
 }
 
@@ -58,7 +66,27 @@ function authHeaders(profile: ProviderProfile, kind: ProviderProfile['protocol']
   return { ...DEFAULT_HEADERS, ...(profile.apiKey ? { Authorization: `Bearer ${profile.apiKey}` } : {}), ...custom }
 }
 
-async function* sseEvents(response: Response): AsyncGenerator<{ event: string; data: any }> {
+type ResponseMeta = NonNullable<ProviderStreamResult['responseMeta']>
+
+function responseMeta(response: Response): ResponseMeta {
+  return {
+    status: response.status,
+    contentType: response.headers.get('content-type') || '',
+    bytes: 0,
+    events: 0,
+    parseMode: 'unknown',
+  }
+}
+
+function responseParseError(message: string, meta: ResponseMeta): Error {
+  const error = new Error(message) as Error & { status?: number; responseMeta?: ResponseMeta }
+  error.status = meta.status
+  error.responseMeta = { ...meta }
+  return error
+}
+
+async function* sseEvents(response: Response, meta: ResponseMeta): AsyncGenerator<{ event: string; data: any }> {
+  meta.parseMode = 'sse'
   if (!response.body) return
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
@@ -72,10 +100,15 @@ async function* sseEvents(response: Response): AsyncGenerator<{ event: string; d
     const event = eventName
     eventName = ''
     if (!raw || raw === '[DONE]') return
-    try { yield { event, data: JSON.parse(raw) } } catch { /* ignore malformed provider fragments */ }
+    try {
+      const data = JSON.parse(raw)
+      meta.events += 1
+      yield { event, data }
+    } catch { /* ignore malformed provider fragments when other events remain valid */ }
   }
   while (true) {
     const { value, done } = await reader.read()
+    meta.bytes += value?.byteLength || 0
     buffer += decoder.decode(value, { stream: !done })
     const lines = buffer.split(/\r?\n/)
     buffer = lines.pop() || ''
@@ -92,10 +125,78 @@ async function* sseEvents(response: Response): AsyncGenerator<{ event: string; d
   }
   if (buffer.startsWith('data:')) dataLines.push(buffer.slice(5).trim())
   for await (const item of flush()) yield item
+  if (meta.bytes > 0 && meta.events === 0) {
+    throw responseParseError('AI 服务返回了无法解析的 SSE 响应', meta)
+  }
+}
+
+function parseBufferedEvents(raw: string, meta: ResponseMeta): Array<{ event: string; data: any }> {
+  const text = raw.trim()
+  if (!text) {
+    meta.parseMode = 'empty'
+    return []
+  }
+
+  try {
+    meta.parseMode = 'json'
+    const parsed = JSON.parse(text)
+    const payloads = Array.isArray(parsed) ? parsed : [parsed]
+    meta.events = payloads.length
+    return payloads.map((data) => ({ event: '', data }))
+  } catch { /* try line-oriented formats below */ }
+
+  const events: Array<{ event: string; data: any }> = []
+  if (/^(?:event|data):/m.test(text)) {
+    meta.parseMode = 'sse'
+    let event = ''
+    let dataLines: string[] = []
+    const flush = () => {
+      const data = dataLines.join('\n').trim()
+      dataLines = []
+      if (!data || data === '[DONE]') { event = ''; return }
+      try { events.push({ event, data: JSON.parse(data) }) } catch { /* checked after parsing */ }
+      event = ''
+    }
+    for (const line of raw.split(/\r?\n/)) {
+      if (!line.trim()) flush()
+      else if (line.startsWith('event:')) event = line.slice(6).trim()
+      else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim())
+    }
+    flush()
+  } else {
+    meta.parseMode = 'ndjson'
+    for (const line of raw.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)) {
+      try { events.push({ event: '', data: JSON.parse(line) }) } catch { /* checked after parsing */ }
+    }
+  }
+  meta.events = events.length
+  if (events.length === 0) throw responseParseError('AI 服务返回了无法识别的响应格式', meta)
+  return events
+}
+
+async function* providerEvents(response: Response, meta: ResponseMeta): AsyncGenerator<{ event: string; data: any }> {
+  if (/text\/event-stream/i.test(meta.contentType)) {
+    for await (const item of sseEvents(response, meta)) yield item
+    return
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer())
+  meta.bytes = bytes.byteLength
+  const raw = new TextDecoder().decode(bytes)
+  for (const item of parseBufferedEvents(raw, meta)) yield item
 }
 
 function emptyResult(): ProviderStreamResult {
   return { content: '', reasoning: '', toolCalls: [], usage: undefined }
+}
+
+function contentText(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (!Array.isArray(value)) return ''
+  return value.map((part) => {
+    if (!part || typeof part !== 'object') return ''
+    const record = part as Record<string, unknown>
+    return typeof record.text === 'string' ? record.text : typeof record.content === 'string' ? record.content : ''
+  }).join('')
 }
 
 function usageFromOpenAI(usage: any) {
@@ -147,6 +248,40 @@ function openAIInput(messages: Array<Record<string, unknown>>): { instructions: 
   return { instructions: system, input }
 }
 
+function appendOpenAIResponseOutput(
+  payload: Record<string, any>,
+  result: ProviderStreamResult,
+  calls: Map<string, { id: string; name: string; args: string }>,
+  input: ProviderStreamInput
+): void {
+  if (!Array.isArray(payload.output) && typeof payload.output_text === 'string') {
+    result.content += payload.output_text
+    input.onText(payload.output_text)
+  }
+  for (const output of Array.isArray(payload.output) ? payload.output : []) {
+    if (output?.type === 'function_call') {
+      const key = String(output.id || output.call_id || randomUUID())
+      const id = String(output.call_id || output.id || key)
+      calls.set(key, { id, name: String(output.name || ''), args: typeof output.arguments === 'string' ? output.arguments : JSON.stringify(output.arguments || {}) })
+      continue
+    }
+    const parts = Array.isArray(output?.content) ? output.content : Array.isArray(output?.summary) ? output.summary : []
+    for (const part of parts) {
+      const text = contentText(part?.text ?? part?.content ?? part?.refusal)
+      if (!text) continue
+      if (output?.type === 'reasoning' || part?.type === 'reasoning_text' || part?.type === 'summary_text') {
+        result.reasoning += text
+        input.onReasoning(text)
+      } else {
+        result.content += text
+        input.onText(text)
+      }
+    }
+  }
+  result.usage = usageFromOpenAI(payload.usage) || result.usage
+  result.finishReason = String(payload.status || result.finishReason || '')
+}
+
 const openAIResponsesAdapter: ProviderAdapter = {
   async stream(input) {
     const { instructions, input: requestInput } = openAIInput(input.messages)
@@ -163,9 +298,11 @@ const openAIResponsesAdapter: ProviderAdapter = {
     })
     if (!response.ok) return readError(response)
     const result = emptyResult()
+    const meta = responseMeta(response)
     const calls = new Map<string, { id: string; name: string; args: string }>()
-    for await (const item of sseEvents(response)) {
+    for await (const item of providerEvents(response, meta)) {
       const data = item.data as Record<string, any>
+      if (data.error) throw responseParseError(providerError(data) || 'AI 服务返回错误', meta)
       if (item.event === 'response.output_text.delta' || data.type === 'response.output_text.delta') {
         const text = String(data.delta || '')
         result.content += text
@@ -176,7 +313,11 @@ const openAIResponsesAdapter: ProviderAdapter = {
         input.onReasoning(text)
       } else if (item.event === 'response.output_item.added' || data.type === 'response.output_item.added') {
         const output = data.item
-        if (output?.type === 'function_call') calls.set(String(output.call_id || output.id || randomUUID()), { id: String(output.call_id || output.id || randomUUID()), name: String(output.name || ''), args: String(output.arguments || '') })
+        if (output?.type === 'function_call') {
+          const key = String(output.id || output.call_id || randomUUID())
+          const id = String(output.call_id || output.id || key)
+          calls.set(key, { id, name: String(output.name || ''), args: String(output.arguments || '') })
+        }
       } else if (item.event === 'response.function_call_arguments.delta' || data.type === 'response.function_call_arguments.delta') {
         const id = String(data.call_id || data.item_id || '')
         const call = calls.get(id)
@@ -184,9 +325,15 @@ const openAIResponsesAdapter: ProviderAdapter = {
       } else if (item.event === 'response.completed' || data.type === 'response.completed') {
         result.usage = usageFromOpenAI(data.response?.usage || data.usage)
         result.finishReason = String(data.response?.status || 'completed')
+        if (!result.content && !result.reasoning && calls.size === 0 && data.response) {
+          appendOpenAIResponseOutput(data.response, result, calls, input)
+        }
+      } else if (Array.isArray(data.output) || typeof data.output_text === 'string') {
+        appendOpenAIResponseOutput(data, result, calls, input)
       }
     }
     result.toolCalls = Array.from(calls.values()).filter((call) => call.name).map((call) => ({ id: call.id, name: call.name, args: parseArgs(call.args) }))
+    result.responseMeta = meta
     return result
   },
   async listModels(profile, signal) { return listOpenAIModels(profile, signal) },
@@ -221,17 +368,20 @@ const openAICompatibleAdapter: ProviderAdapter = {
     })
     if (!response.ok) return readError(response)
     const result = emptyResult()
+    const meta = responseMeta(response)
     const calls = new Map<number, { id: string; name: string; args: string }>()
-    for await (const item of sseEvents(response)) {
-      const chunk = item.data as any
+    for await (const item of providerEvents(response, meta)) {
+      const rawChunk = item.data as any
+      const chunk = rawChunk?.data?.choices ? rawChunk.data : rawChunk
+      if (chunk?.error) throw responseParseError(providerError(chunk) || 'AI 服务返回错误', meta)
       result.usage = usageFromOpenAI(chunk?.usage) || result.usage
       const choice = chunk?.choices?.[0]
       if (!choice) continue
       result.finishReason = choice.finish_reason || result.finishReason
-      const delta = choice.delta || {}
-      const text = typeof delta.content === 'string' ? delta.content : ''
+      const delta = choice.delta || choice.message || choice
+      const text = contentText(delta.content ?? delta.text)
       if (text) { result.content += text; input.onText(text) }
-      const reasoning = typeof delta.reasoning_content === 'string' ? delta.reasoning_content : ''
+      const reasoning = contentText(delta.reasoning_content ?? delta.reasoning)
       if (reasoning) { result.reasoning += reasoning; input.onReasoning(reasoning) }
       for (const toolCall of Array.isArray(delta.tool_calls) ? delta.tool_calls : []) {
         const index = Number(toolCall.index ?? 0)
@@ -239,10 +389,18 @@ const openAICompatibleAdapter: ProviderAdapter = {
         if (toolCall.id) current.id = String(toolCall.id)
         if (toolCall.function?.name) current.name += String(toolCall.function.name)
         if (typeof toolCall.function?.arguments === 'string') current.args += toolCall.function.arguments
+        else if (toolCall.function?.arguments && typeof toolCall.function.arguments === 'object') current.args = JSON.stringify(toolCall.function.arguments)
         calls.set(index, current)
+      }
+      if (delta.function_call?.name) {
+        const current = calls.get(0) || { id: `call_${randomUUID()}`, name: '', args: '' }
+        current.name += String(delta.function_call.name)
+        if (typeof delta.function_call.arguments === 'string') current.args += delta.function_call.arguments
+        calls.set(0, current)
       }
     }
     result.toolCalls = Array.from(calls.values()).filter((call) => call.name).map((call) => ({ id: call.id, name: call.name, args: parseArgs(call.args) }))
+    result.responseMeta = meta
     return result
   },
   async listModels(profile, signal) { return listOpenAIModels(profile, signal) },
@@ -296,9 +454,11 @@ const anthropicAdapter: ProviderAdapter = {
     })
     if (!response.ok) return readError(response)
     const result = emptyResult()
+    const meta = responseMeta(response)
     const calls = new Map<number, { id: string; name: string; args: string }>()
-    for await (const item of sseEvents(response)) {
+    for await (const item of providerEvents(response, meta)) {
       const data = item.data as any
+      if (data?.type === 'error' || data?.error) throw responseParseError(providerError(data) || 'AI 服务返回错误', meta)
       if (data.type === 'message_start') result.usage = usageFromAnthropic(data.message?.usage)
       if (data.type === 'content_block_start' && data.content_block?.type === 'tool_use') {
         calls.set(Number(data.index), { id: String(data.content_block.id || randomUUID()), name: String(data.content_block.name || ''), args: '' })
@@ -312,8 +472,18 @@ const anthropicAdapter: ProviderAdapter = {
         result.finishReason = String(data.delta?.stop_reason || '')
         if (data.usage) result.usage = { ...(result.usage || emptyUsage()), ...usageFromAnthropic(data.usage) }
       }
+      if (data.type === 'message' && Array.isArray(data.content)) {
+        for (const [index, block] of data.content.entries()) {
+          if (block?.type === 'text' && typeof block.text === 'string') { result.content += block.text; input.onText(block.text) }
+          if (block?.type === 'thinking' && typeof block.thinking === 'string') { result.reasoning += block.thinking; input.onReasoning(block.thinking) }
+          if (block?.type === 'tool_use') calls.set(index, { id: String(block.id || randomUUID()), name: String(block.name || ''), args: JSON.stringify(block.input || {}) })
+        }
+        result.finishReason = String(data.stop_reason || result.finishReason || '')
+        result.usage = usageFromAnthropic(data.usage) || result.usage
+      }
     }
     result.toolCalls = Array.from(calls.values()).filter((call) => call.name).map((call) => ({ id: call.id, name: call.name, args: parseArgs(call.args) }))
+    result.responseMeta = meta
     return result
   },
   async listModels(profile, signal) {
@@ -367,8 +537,10 @@ const googleAdapter: ProviderAdapter = {
     const response = await fetch(url, { method: 'POST', headers: authHeaders(input.profile, 'google'), body: JSON.stringify(body), signal: input.signal })
     if (!response.ok) return readError(response)
     const result = emptyResult()
-    for await (const item of sseEvents(response)) {
+    const meta = responseMeta(response)
+    for await (const item of providerEvents(response, meta)) {
       const payload = item.data as any
+      if (payload?.error) throw responseParseError(providerError(payload) || 'AI 服务返回错误', meta)
       const parts = payload?.candidates?.[0]?.content?.parts || []
       for (const part of parts) {
         if (part.thought === true && typeof part.text === 'string') { result.reasoning += part.text; input.onReasoning(part.text) }
@@ -379,6 +551,7 @@ const googleAdapter: ProviderAdapter = {
       if (usage) result.usage = { promptTokens: Number(usage.promptTokenCount) || 0, completionTokens: Number(usage.candidatesTokenCount) || 0, reasoningTokens: Number(usage.thoughtsTokenCount) || 0, totalTokens: Number(usage.totalTokenCount) || 0, promptCacheHitTokens: Number(usage.cachedContentTokenCount) || 0 }
       result.finishReason = String(payload?.candidates?.[0]?.finishReason || result.finishReason || '')
     }
+    result.responseMeta = meta
     return result
   },
   async listModels(profile, signal) {

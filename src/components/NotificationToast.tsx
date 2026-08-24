@@ -36,7 +36,7 @@ interface NotificationToastProps {
 /**
  * 通知卡片：始终渲染为全局液态玻璃（LiquidGlass 兼容层），在独立通知窗口内展示。
  * 折射背景：原生面板（默认关闭）或主进程下发的静态桌面快照（CSS 滤镜就地加工）。
- * 除悬停平滑放大外无任何鼠标交互（不可点击、无关闭按钮，5 秒后自动消失）。
+ * 通知可点击返回主窗口，默认 5 秒后自动消失。
  */
 export function NotificationToast({
     data,
@@ -66,13 +66,19 @@ export function NotificationToast({
 
             if (data.persistent) return
 
+            let closeTimer: ReturnType<typeof setTimeout> | undefined
             const timer = setTimeout(() => {
                 beginHide()
                 // clean up data after animation
-                setTimeout(onClose, 300)
+                closeTimer = setTimeout(onClose, 300)
             }, duration)
 
-            return () => clearTimeout(timer)
+            // 新通知可能恰好在旧通知的退场动画期间到达。两级定时器都必须
+            // 取消，否则旧通知遗留的 onClose 会把新通知一起关掉。
+            return () => {
+                clearTimeout(timer)
+                if (closeTimer) clearTimeout(closeTimer)
+            }
         } else {
             setIsVisible(false)
         }

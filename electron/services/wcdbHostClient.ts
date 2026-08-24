@@ -65,6 +65,8 @@ function resolveHostExe(): string {
 export class WcdbHostClient extends EventEmitter {
   private child: ChildProcess | null = null
   private killed = false
+  private startupError: Error | null = null
+  private recentStderr = ''
   /** 单次调用超时（默认 3 分钟；超出视为宿主卡死，报错而不是挂死应用） */
   private readonly requestTimeoutMs = Number(process.env.WEPORT_WCDB_TIMEOUT_MS || 180_000)
 
@@ -73,9 +75,10 @@ export class WcdbHostClient extends EventEmitter {
     try {
       this.spawnHost()
     } catch (e) {
+      this.startupError = e instanceof Error ? e : new Error(String(e))
       // 延迟抛错，让 callWorker 侧拿到明确错误
       process.nextTick(() => {
-        this.emit('error', e)
+        this.emit('error', this.startupError)
       })
     }
   }
@@ -89,6 +92,9 @@ export class WcdbHostClient extends EventEmitter {
       hostScript = join(process.cwd(), 'dist-electron', 'wcdbHost.js')
     } else {
       hostScript = join(process.resourcesPath, 'host', 'wcdbHost.js')
+    }
+    if (!existsSync(hostScript)) {
+      throw new Error(`WCDB 宿主脚本缺失: ${hostScript}。请重新安装完整版本。`)
     }
     const args: string[] = [hostScript]
 
@@ -114,7 +120,22 @@ export class WcdbHostClient extends EventEmitter {
     // 见 scripts/prepare-host-bundle.cjs），用 NODE_PATH 补解析；dev 走项目
     // node_modules 正常解析，无需设置
     if (process.env.WEPORT_DEV_MODE !== '1') {
-      env.NODE_PATH = join(process.resourcesPath, 'host', 'libs')
+      const libsPath = join(process.resourcesPath, 'host', 'libs')
+      const koffiPath = join(libsPath, 'koffi', 'package.json')
+      const nativeKoffiPath = join(libsPath, '@koromix', `koffi-${process.platform}-${process.arch}`)
+      if (!existsSync(koffiPath) || !existsSync(nativeKoffiPath)) {
+        throw new Error(`WCDB 宿主 Koffi 组件缺失: ${libsPath}。请重新安装完整版本。`)
+      }
+      env.NODE_PATH = libsPath
+
+      const wcdbLibraryPath = process.platform === 'win32'
+        ? join(resourcesPath, 'wcdb', 'win32', process.arch, 'wcdb_api.dll')
+        : process.platform === 'darwin'
+          ? join(resourcesPath, 'wcdb', 'macos', 'universal', 'libwcdb_api.dylib')
+          : ''
+      if (wcdbLibraryPath && !existsSync(wcdbLibraryPath)) {
+        throw new Error(`WCDB 动态库缺失: ${wcdbLibraryPath}。请重新安装完整版本。`)
+      }
     }
 
     this.child = spawn(hostExe, args, {
@@ -129,22 +150,25 @@ export class WcdbHostClient extends EventEmitter {
 
     this.child.stderr!.on('data', (chunk: Buffer) => {
       const text = chunk.toString().trim()
-      if (text) console.error('[wcdb-host]', text)
+      if (text) {
+        this.recentStderr = `${this.recentStderr}\n${text}`.trim().slice(-4000)
+        console.error('[wcdb-host]', text)
+      }
     })
 
     this.child.on('error', (err) => {
       this.emit('error', err)
     })
 
-    this.child.on('exit', (code) => {
-      this.emit('exit', code)
+    this.child.on('exit', (code, signal) => {
+      this.emit('exit', code, signal)
       this.child = null
     })
   }
 
   postMessage(msg: any): boolean {
     if (!this.child || this.child.killed) {
-      this.emit('error', new Error('WCDB 宿主进程不可用'))
+      this.emit('error', this.startupError || new Error('WCDB 宿主进程不可用'))
       return false
     }
     try {
@@ -153,6 +177,10 @@ export class WcdbHostClient extends EventEmitter {
       this.emit('error', e instanceof Error ? e : new Error(String(e)))
       return false
     }
+  }
+
+  getRecentStderr(): string {
+    return this.recentStderr
   }
 
   /** 同步强杀宿主进程（退出兜底路径使用：app.exit 会等待 IPC 子进程回收） */
